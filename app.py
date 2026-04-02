@@ -1,54 +1,48 @@
 #!/usr/bin/env python3
 """
-Mental Rotation Task - Flask + SQLite + CSV export
-Designed for Qualtrics -> hosted web app -> save data -> optional redirect back.
+Mental Rotation Task - Flask + Supabase + one-row-per-participant checkpoint storage
 
-Folder layout:
-  app.py
-  imgs/         (contains 64 real stimuli .png files)
-  prac_imgs/    (contains practice .png files)
+Storage model:
+- Exactly ONE row per participant/session in public.sessions
+- No per-trial database rows used by the app
+- Checkpoints every 32 REAL trials append into responses_json in the same sessions row
+- Resume from last saved checkpoint
+- Completed participant_id is blocked from re-entering
+- /data allows password-protected CSV download (one row per participant)
 
-Outputs:
-  data.db       (SQLite database; server-side storage)
-  data.csv      (one summary row per completed participant, similar to prior workflow)
+Environment variables required:
+  SUPABASE_URL
+  SUPABASE_SERVICE_ROLE_KEY
 
-Qualtrics launch example:
-  https://your-app.onrender.com/?participant_id=${e://Field/participant_id}
-
-Optional return URL:
-  https://your-app.onrender.com/?participant_id=${e://Field/participant_id}&return_url=https%3A%2F%2Fyour-qualtrics-return-link
-
-Notes:
-- participant_id is required from the URL.
-- return_url is optional.
-- practice is not timed/scored/recorded.
-- real task preserves 3 cycles of the 64 stimuli = 192 real trials.
-- 5 attention checks are extra trials.
-- detailed data is saved in SQLite.
-- on finish, a summary row is appended to CSV as well.
+Optional environment variables:
+  SECRET_KEY
+  PORT
+  DATA_EXPORT_PASSWORD   (defaults to HUT2026)
 """
 
 from __future__ import annotations
 
 import csv
+import hmac
+import io
+import json
 import os
 import random
 import re
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import requests
 from flask import (
     Flask,
+    Response,
     jsonify,
-    redirect,
     render_template_string,
     request,
     send_from_directory,
-    url_for,
 )
 
 # ============================================================
@@ -59,21 +53,125 @@ BASE_DIR = Path(__file__).resolve().parent
 IMGS_DIR = BASE_DIR / "imgs"
 PRAC_DIR = BASE_DIR / "prac_imgs"
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_PATH = DATA_DIR / "data.db"
-CSV_PATH = DATA_DIR / "data.csv"
-
 ATTN_N = 5
+CHECKPOINT_SIZE = 32
 SECRET_KEY = os.environ.get("SECRET_KEY", "replace-this-in-production")
 PORT = int(os.environ.get("PORT", "5000"))
+DATA_EXPORT_PASSWORD = os.environ.get("DATA_EXPORT_PASSWORD", "HUT2026")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+if not SUPABASE_URL:
+    raise RuntimeError("Missing SUPABASE_URL environment variable")
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_SERVICE_ROLE_KEY environment variable")
+
+REST_BASE = f"{SUPABASE_URL}/rest/v1"
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 
 # ============================================================
-# Helpers
+# Supabase helpers
+# ============================================================
+
+def supabase_headers(prefer: str | None = None) -> dict[str, str]:
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+def supabase_request(
+    method: str,
+    table_or_path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_data: Any = None,
+    prefer: str | None = None,
+    timeout: int = 30,
+) -> requests.Response:
+    url = table_or_path if table_or_path.startswith("http") else f"{REST_BASE}/{table_or_path.lstrip('/')}"
+    resp = requests.request(
+        method=method.upper(),
+        url=url,
+        headers=supabase_headers(prefer=prefer),
+        params=params,
+        json=json_data,
+        timeout=timeout,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Supabase error {resp.status_code}: {resp.text}")
+    return resp
+
+def supabase_insert(table: str, row: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    resp = supabase_request("POST", table, json_data=row, prefer="return=representation")
+    data = resp.json()
+    return data if isinstance(data, list) else [data]
+
+def supabase_select(
+    table: str,
+    *,
+    select: str = "*",
+    filters: dict[str, str] | None = None,
+    order: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"select": select}
+    if filters:
+        params.update(filters)
+    if order:
+        params["order"] = order
+    if limit is not None:
+        params["limit"] = str(limit)
+    if offset is not None:
+        params["offset"] = str(offset)
+    return supabase_request("GET", table, params=params).json()
+
+def supabase_update(
+    table: str,
+    *,
+    filters: dict[str, str],
+    patch: dict[str, Any],
+) -> list[dict[str, Any]]:
+    resp = supabase_request("PATCH", table, params=filters, json_data=patch, prefer="return=representation")
+    data = resp.json()
+    return data if isinstance(data, list) else [data]
+
+def supabase_fetch_all(
+    table: str,
+    *,
+    select: str = "*",
+    filters: dict[str, str] | None = None,
+    order: str | None = None,
+    page_size: int = 1000,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        chunk = supabase_select(
+            table,
+            select=select,
+            filters=filters,
+            order=order,
+            limit=page_size,
+            offset=offset,
+        )
+        if not chunk:
+            break
+        out.extend(chunk)
+        if len(chunk) < page_size:
+            break
+        offset += page_size
+    return out
+
+# ============================================================
+# Stimulus helpers
 # ============================================================
 
 def list_pngs(folder: Path) -> list[str]:
@@ -93,21 +191,10 @@ def list_practice() -> list[str]:
 def is_reference(imgname: str) -> bool:
     return "reference" in imgname.lower()
 
-def is_centered(imgname: str) -> bool:
-    return "centered" in imgname.lower()
-
 def is_mirrored(imgname: str) -> bool:
     return "mirrored" in imgname.lower()
 
-def is_normal(imgname: str) -> bool:
-    return "normal" in imgname.lower()
-
 def correct_answer(imgname: str) -> str:
-    """
-    Answer vocabulary:
-      - reference images: "same" or "mirrored"
-      - centered images:  "normal" or "mirrored"
-    """
     if is_reference(imgname):
         return "mirrored" if is_mirrored(imgname) else "same"
     return "mirrored" if is_mirrored(imgname) else "normal"
@@ -128,24 +215,16 @@ def parse_stim(img: str) -> StimInfo | None:
     m = _STIM_RE.match(img)
     if not m:
         return None
-    letter = m.group("letter").upper()
-    kind = m.group("kind").lower()
-    state = m.group("state").lower()
-    angle = m.group("angle")
-    try:
-        angle_i = int(angle)
-        angle = f"{angle_i:03d}"
-    except Exception:
-        pass
-    return StimInfo(letter=letter, kind=kind, state=state, angle=angle)
+    return StimInfo(
+        letter=m.group("letter").upper(),
+        kind=m.group("kind").lower(),
+        state=m.group("state").lower(),
+        angle=f"{int(m.group('angle')):03d}",
+    )
 
 def build_real_trial_sequence(stimuli64: list[str]) -> list[dict[str, Any]]:
-    """
-    3 cycles. Each cycle is a random permutation of the 64 stimuli.
-    Returns 192 REAL trial dicts.
-    """
     seq: list[dict[str, Any]] = []
-    order = 1
+    order_index = 1
     for cycle in (1, 2, 3):
         perm = stimuli64[:]
         random.shuffle(perm)
@@ -153,23 +232,18 @@ def build_real_trial_sequence(stimuli64: list[str]) -> list[dict[str, Any]]:
             seq.append({
                 "kind": "real",
                 "dir": "imgs",
-                "order_index": order,
+                "order_index": order_index,
                 "cycle": cycle,
                 "img": img,
             })
-            order += 1
+            order_index += 1
     return seq
 
 def insert_attention_trials(real_trials: list[dict[str, Any]], stimuli64: list[str], n: int) -> list[dict[str, Any]]:
-    """
-    Insert n attention checks randomly throughout the flow.
-    """
     if n <= 0:
         return real_trials[:]
-
     flow = real_trials[:]
     positions = sorted(random.sample(range(len(flow) + 1), k=n), reverse=True)
-
     for k, pos in enumerate(positions, start=1):
         img = random.choice(stimuli64)
         flow.insert(pos, {
@@ -178,513 +252,261 @@ def insert_attention_trials(real_trials: list[dict[str, Any]], stimuli64: list[s
             "img": img,
             "attn_id": k,
         })
-
     return flow
 
 def pick_practice_trials(prac_pngs: list[str]) -> list[dict[str, Any]]:
-    """
-    Exactly 4 practice images in this order:
-      1) centered_normal
-      2) centered_mirrored
-      3) reference_normal
-      4) reference_mirrored
-    Angle can be random.
-    """
     def pick(where_kind: str, where_state: str) -> str:
-        candidates = []
-        for p in prac_pngs:
-            low = p.lower()
-            if where_kind in low and where_state in low:
-                candidates.append(p)
+        candidates = [p for p in prac_pngs if where_kind in p.lower() and where_state in p.lower()]
         if not candidates:
             raise FileNotFoundError(
                 f"Could not find practice image matching '{where_kind}_{where_state}' in {PRAC_DIR.resolve()}"
             )
         return random.choice(candidates)
 
-    img1 = pick("centered", "normal")
-    img2 = pick("centered", "mirrored")
-    img3 = pick("reference", "normal")
-    img4 = pick("reference", "mirrored")
-
     return [
-        {"kind": "prac", "dir": "prac_imgs", "img": img1},
-        {"kind": "prac", "dir": "prac_imgs", "img": img2},
-        {"kind": "prac", "dir": "prac_imgs", "img": img3},
-        {"kind": "prac", "dir": "prac_imgs", "img": img4},
+        {"kind": "prac", "dir": "prac_imgs", "img": pick("centered", "normal")},
+        {"kind": "prac", "dir": "prac_imgs", "img": pick("centered", "mirrored")},
+        {"kind": "prac", "dir": "prac_imgs", "img": pick("reference", "normal")},
+        {"kind": "prac", "dir": "prac_imgs", "img": pick("reference", "mirrored")},
     ]
 
 # ============================================================
-# Block A aggregation
+# Session helpers
 # ============================================================
 
-def build_canonical_map(stimuli_sorted: list[str]) -> dict[tuple[str, str, str], str]:
-    """
-    Map (letter, angle, kind) -> canonical filename.
-    Canonical preference: normal > anything else.
-    """
-    bucket: dict[tuple[str, str, str], list[str]] = {}
-    for img in stimuli_sorted:
-        info = parse_stim(img)
-        if not info:
-            continue
-        if info.letter not in ("R", "G"):
-            continue
-        if info.kind not in ("centered", "reference"):
-            continue
-        key = (info.letter, info.angle, info.kind)
-        bucket.setdefault(key, []).append(img)
-
-    canon: dict[tuple[str, str, str], str] = {}
-    for key, imgs in bucket.items():
-        normals = [x for x in imgs if is_normal(x)]
-        chosen = sorted(normals)[0] if normals else sorted(imgs)[0]
-        canon[key] = chosen
-    return canon
-
-def angles_for_letter(canon: dict[tuple[str, str, str], str], letter: str) -> list[str]:
-    return sorted({angle for (L, angle, kind) in canon.keys() if L == letter and kind in ("centered", "reference")})
-
-def build_block_a_headers(stimuli_sorted: list[str]) -> list[str]:
-    canon = build_canonical_map(stimuli_sorted)
-    cols: list[str] = []
-
-    for letter in ("R", "G"):
-        for angle in angles_for_letter(canon, letter):
-            base = f"{letter}_{angle}"
-            cols.append(f"{base}_mean_time")
-            cols.append(f"{base}_mean_time_scored")
-            cols.append(f"{base}_score")
-
-            cols.append(f"reference_{base}_mean_time")
-            cols.append(f"reference_{base}_mean_time_scored")
-            cols.append(f"reference_{base}_score")
-
-            cols.append(f"centered_{base}_mean_time")
-            cols.append(f"centered_{base}_mean_time_scored")
-            cols.append(f"centered_{base}_score")
-
-    for letter in ("R", "G"):
-        cols.append(f"{letter}_mean_time")
-        cols.append(f"{letter}_mean_time_scored")
-        cols.append(f"{letter}_score")
-
-        cols.append(f"reference_{letter}_mean_time")
-        cols.append(f"reference_{letter}_mean_time_scored")
-        cols.append(f"reference_{letter}_score")
-
-        cols.append(f"centered_{letter}_mean_time")
-        cols.append(f"centered_{letter}_mean_time_scored")
-        cols.append(f"centered_{letter}_score")
-
-    return cols
-
-def mean_or_blank(values: list[int]) -> str:
-    if not values:
-        return ""
-    return f"{(sum(values) / len(values)):.6g}"
-
-def compute_block_a_from_trials(stimuli_sorted: list[str], ident_times: dict[tuple[int, str], int], ident_corr: dict[tuple[int, str], int]) -> dict[str, str | int]:
-    canon = build_canonical_map(stimuli_sorted)
-    out: dict[str, str | int] = {}
-
-    def collect(imgs: list[str]) -> tuple[list[int], list[int]]:
-        times: list[int] = []
-        corrs: list[int] = []
-        for cycle in (1, 2, 3):
-            for img in imgs:
-                t = ident_times.get((cycle, img))
-                c = ident_corr.get((cycle, img))
-                if t is None or c is None:
-                    continue
-                times.append(int(t))
-                corrs.append(int(c))
-        return times, corrs
-
-    def write_mean_score(prefix: str, times: list[int], corrs: list[int]) -> None:
-        out[f"{prefix}_mean_time"] = mean_or_blank(times)
-        scored_times = [t for (t, c) in zip(times, corrs) if c == 1]
-        out[f"{prefix}_mean_time_scored"] = mean_or_blank(scored_times)
-        out[f"{prefix}_score"] = int(sum(corrs)) if corrs else 0
-
-    for letter in ("R", "G"):
-        for angle in angles_for_letter(canon, letter):
-            ref_img = canon.get((letter, angle, "reference"))
-            cen_img = canon.get((letter, angle, "centered"))
-
-            ref_imgs = [ref_img] if ref_img else []
-            cen_imgs = [cen_img] if cen_img else []
-            both_imgs = ref_imgs + cen_imgs
-
-            times, corrs = collect(both_imgs)
-            write_mean_score(f"{letter}_{angle}", times, corrs)
-
-            times, corrs = collect(ref_imgs)
-            write_mean_score(f"reference_{letter}_{angle}", times, corrs)
-
-            times, corrs = collect(cen_imgs)
-            write_mean_score(f"centered_{letter}_{angle}", times, corrs)
-
-    for letter in ("R", "G"):
-        ref_imgs: list[str] = []
-        cen_imgs: list[str] = []
-        for angle in angles_for_letter(canon, letter):
-            ri = canon.get((letter, angle, "reference"))
-            ci = canon.get((letter, angle, "centered"))
-            if ri:
-                ref_imgs.append(ri)
-            if ci:
-                cen_imgs.append(ci)
-
-        both_imgs = ref_imgs + cen_imgs
-
-        times, corrs = collect(both_imgs)
-        write_mean_score(letter, times, corrs)
-
-        times, corrs = collect(ref_imgs)
-        write_mean_score(f"reference_{letter}", times, corrs)
-
-        times, corrs = collect(cen_imgs)
-        write_mean_score(f"centered_{letter}", times, corrs)
-
-    return out
-
-# ============================================================
-# CSV header / export
-# ============================================================
-
-def build_csv_header(stimuli64_sorted: list[str]) -> list[str]:
-    header: list[str] = [
-        "participant_id",
-        "session_id",
-        "started_at_unix",
-        "finished_at_unix",
-        "attention",
-    ]
-
-    for cycle in (1, 2, 3):
-        for img in stimuli64_sorted:
-            header.append(f"c{cycle}_{img}_time_ms")
-
-    for cycle in (1, 2, 3):
-        for img in stimuli64_sorted:
-            header.append(f"c{cycle}_{img}_correct")
-
-    for i in range(1, 193):
-        header.append(f"order_{i}_time_ms")
-
-    for i in range(1, 193):
-        header.append(f"order_{i}_correct")
-
-    header.extend(build_block_a_headers(stimuli64_sorted))
-    return header
-
-def ensure_csv_exists(header: list[str]) -> None:
-    if CSV_PATH.exists():
-        return
-    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-
-# ============================================================
-# SQLite
-# ============================================================
-
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db() -> None:
-    conn = get_conn()
+def json_load_maybe(s: str | None, default: Any) -> Any:
+    if not s:
+        return default
     try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                participant_id TEXT NOT NULL,
-                return_url TEXT,
-                started_at_unix REAL NOT NULL,
-                finished_at_unix REAL,
-                status TEXT NOT NULL,
-                attention_correct INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS trials (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                participant_id TEXT NOT NULL,
-                trial_kind TEXT NOT NULL,
-                order_index INTEGER,
-                cycle INTEGER,
-                img TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                correct INTEGER NOT NULL,
-                time_ms INTEGER NOT NULL,
-                recorded_at_unix REAL NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS session_payloads (
-                session_id TEXT PRIMARY KEY,
-                stimuli_sorted_json TEXT NOT NULL,
-                practice_json TEXT NOT NULL,
-                flow_json TEXT NOT NULL,
-                real_trials_json TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
-            )
-        """)
-        conn.commit()
-    finally:
-        conn.close()
+        return json.loads(s)
+    except Exception:
+        return default
 
-# ============================================================
-# Session data helpers
-# ============================================================
+def get_session_by_participant(participant_id: str) -> dict[str, Any] | None:
+    rows = supabase_select(
+        "sessions",
+        filters={"participant_id": f"eq.{participant_id}"},
+        limit=1,
+    )
+    return rows[0] if rows else None
 
-def create_session(participant_id: str, return_url: str | None) -> dict[str, Any]:
+def get_session_by_id(session_id: str) -> dict[str, Any]:
+    rows = supabase_select(
+        "sessions",
+        filters={"session_id": f"eq.{session_id}"},
+        limit=1,
+    )
+    if not rows:
+        raise ValueError("Invalid session")
+    return rows[0]
+
+def create_new_session(participant_id: str, return_url: str | None) -> dict[str, Any]:
     stimuli64 = list_stimuli()
-    stimuli_sorted = sorted(stimuli64)
-    prac_pngs = list_practice()
-    practice = pick_practice_trials(prac_pngs)
+    practice = pick_practice_trials(list_practice())
     real_trials = build_real_trial_sequence(stimuli64)
     flow = insert_attention_trials(real_trials, stimuli64, ATTN_N)
 
     session_id = uuid.uuid4().hex
     started_at = time.time()
 
-    import json
-
-    conn = get_conn()
-    try:
-        conn.execute("""
-            INSERT INTO sessions (session_id, participant_id, return_url, started_at_unix, status, attention_correct)
-            VALUES (?, ?, ?, ?, 'in_progress', 0)
-        """, (session_id, participant_id, return_url, started_at))
-
-        conn.execute("""
-            INSERT INTO session_payloads (session_id, stimuli_sorted_json, practice_json, flow_json, real_trials_json)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            session_id,
-            json.dumps(stimuli_sorted),
-            json.dumps(practice),
-            json.dumps(flow),
-            json.dumps(real_trials),
-        ))
-        conn.commit()
-    finally:
-        conn.close()
-
-    return {
+    supabase_insert("sessions", {
         "session_id": session_id,
         "participant_id": participant_id,
         "return_url": return_url,
-        "stimuli_sorted": stimuli_sorted,
+        "started_at_unix": started_at,
+        "finished_at_unix": None,
+        "status": "in_progress",
+        "attention_correct": 0,
+        "completed_real_trials": 0,
+        "last_saved_pos": 0,
+        "practice_json": json.dumps(practice),
+        "flow_json": json.dumps(flow),
+        "responses_json": json.dumps([]),
+    })
+
+    return {
+        "mode": "new",
+        "session_id": session_id,
+        "participant_id": participant_id,
+        "return_url": return_url,
         "practice": practice,
         "flow": flow,
-        "real_trials": real_trials,
+        "resume_index": 0,
+        "completed_real_trials": 0,
     }
 
-def load_session_payload(session_id: str) -> dict[str, Any]:
-    import json
+def load_or_create_session(participant_id: str, return_url: str | None) -> dict[str, Any]:
+    existing = get_session_by_participant(participant_id)
 
-    conn = get_conn()
-    try:
-        sess = conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if not sess:
-            raise ValueError("Session not found")
-
-        payload = conn.execute(
-            "SELECT * FROM session_payloads WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if not payload:
-            raise ValueError("Session payload not found")
-
-        return {
-            "session_id": sess["session_id"],
-            "participant_id": sess["participant_id"],
-            "return_url": sess["return_url"],
-            "started_at_unix": sess["started_at_unix"],
-            "finished_at_unix": sess["finished_at_unix"],
-            "status": sess["status"],
-            "attention_correct": sess["attention_correct"],
-            "stimuli_sorted": json.loads(payload["stimuli_sorted_json"]),
-            "practice": json.loads(payload["practice_json"]),
-            "flow": json.loads(payload["flow_json"]),
-            "real_trials": json.loads(payload["real_trials_json"]),
-        }
-    finally:
-        conn.close()
-
-def record_trial(session_id: str, kind: str, order_index: int | None, cycle: int | None, img: str, answer: str, time_ms: int) -> None:
-    conn = get_conn()
-    try:
-        sess = conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if not sess:
-            raise ValueError("Invalid session")
-        if sess["status"] == "finished":
-            raise ValueError("Session already finished")
-
-        participant_id = sess["participant_id"]
-
-        if kind == "attn":
-            correct = 1 if answer == "same" else 0
-            conn.execute("""
-                INSERT INTO trials (
-                    session_id, participant_id, trial_kind, order_index, cycle, img,
-                    answer, correct, time_ms, recorded_at_unix
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                session_id, participant_id, kind, None, None, img,
-                answer, correct, time_ms, time.time()
-            ))
-            if correct == 1:
-                conn.execute("""
-                    UPDATE sessions
-                    SET attention_correct = attention_correct + 1
-                    WHERE session_id = ?
-                """, (session_id,))
-            conn.commit()
-            return
-
-        if kind != "real":
-            raise ValueError("Bad trial kind")
-
-        if order_index is None or cycle is None:
-            raise ValueError("Missing order_index/cycle")
-
-        correct = 1 if answer == correct_answer(img) else 0
-
-        already = conn.execute("""
-            SELECT 1 FROM trials
-            WHERE session_id = ? AND trial_kind = 'real' AND order_index = ?
-        """, (session_id, order_index)).fetchone()
-
-        if already:
-            raise ValueError("This real trial was already recorded")
-
-        conn.execute("""
-            INSERT INTO trials (
-                session_id, participant_id, trial_kind, order_index, cycle, img,
-                answer, correct, time_ms, recorded_at_unix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            session_id, participant_id, kind, order_index, cycle, img,
-            answer, correct, time_ms, time.time()
-        ))
-        conn.commit()
-    finally:
-        conn.close()
-
-def finish_session(session_id: str) -> dict[str, Any]:
-    payload = load_session_payload(session_id)
-    stimuli_sorted = payload["stimuli_sorted"]
-
-    conn = get_conn()
-    try:
-        sess = conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if not sess:
-            raise ValueError("Invalid session")
-
-        if sess["status"] == "finished":
+    if existing:
+        if existing.get("status") == "finished":
             return {
-                "ok": True,
-                "already": True,
-                "return_url": sess["return_url"],
+                "mode": "completed",
+                "message": "Your ID Has Already Cleared the Trials",
             }
 
-        real_trials = conn.execute("""
-            SELECT * FROM trials
-            WHERE session_id = ? AND trial_kind = 'real'
-            ORDER BY order_index ASC
-        """, (session_id,)).fetchall()
+        practice = json_load_maybe(existing.get("practice_json"), [])
+        flow = json_load_maybe(existing.get("flow_json"), [])
+        completed_real_trials = int(existing.get("completed_real_trials") or 0)
+        resume_index = int(existing.get("last_saved_pos") or 0)
 
-        if len(real_trials) != 192:
-            raise ValueError(f"Not all 192 real trials were recorded. Found {len(real_trials)}.")
-
-        attn_trials = conn.execute("""
-            SELECT * FROM trials
-            WHERE session_id = ? AND trial_kind = 'attn'
-            ORDER BY id ASC
-        """, (session_id,)).fetchall()
-
-        ident_times: dict[tuple[int, str], int] = {}
-        ident_corr: dict[tuple[int, str], int] = {}
-        order_times: list[int | None] = [None] * 192
-        order_corr: list[int | None] = [None] * 192
-
-        for tr in real_trials:
-            cyc = int(tr["cycle"])
-            img = str(tr["img"])
-            tms = int(tr["time_ms"])
-            cor = int(tr["correct"])
-            oi = int(tr["order_index"])
-
-            ident_times[(cyc, img)] = tms
-            ident_corr[(cyc, img)] = cor
-            order_times[oi - 1] = tms
-            order_corr[oi - 1] = cor
-
-        if any(v is None for v in order_times) or any(v is None for v in order_corr):
-            raise ValueError("Order logging incomplete.")
-
-        header = build_csv_header(stimuli_sorted)
-        ensure_csv_exists(header)
-
-        row: dict[str, Any] = {}
-        row["participant_id"] = sess["participant_id"]
-        row["session_id"] = sess["session_id"]
-        row["started_at_unix"] = sess["started_at_unix"]
-        row["finished_at_unix"] = time.time()
-        row["attention"] = sess["attention_correct"]
-
-        for cycle in (1, 2, 3):
-            for img in stimuli_sorted:
-                row[f"c{cycle}_{img}_time_ms"] = ident_times.get((cycle, img), "")
-
-        for cycle in (1, 2, 3):
-            for img in stimuli_sorted:
-                row[f"c{cycle}_{img}_correct"] = ident_corr.get((cycle, img), "")
-
-        for i in range(1, 193):
-            row[f"order_{i}_time_ms"] = order_times[i - 1]
-
-        for i in range(1, 193):
-            row[f"order_{i}_correct"] = order_corr[i - 1]
-
-        block_a = compute_block_a_from_trials(stimuli_sorted, ident_times, ident_corr)
-        row.update(block_a)
-
-        with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([row.get(col, "") for col in header])
-
-        conn.execute("""
-            UPDATE sessions
-            SET finished_at_unix = ?, status = 'finished'
-            WHERE session_id = ?
-        """, (row["finished_at_unix"], session_id))
-        conn.commit()
+        if return_url and existing.get("return_url") != return_url:
+            supabase_update(
+                "sessions",
+                filters={"session_id": f"eq.{existing['session_id']}"},
+                patch={"return_url": return_url},
+            )
+            existing["return_url"] = return_url
 
         return {
-            "ok": True,
-            "already": False,
-            "return_url": sess["return_url"],
+            "mode": "resume",
+            "session_id": existing["session_id"],
+            "participant_id": participant_id,
+            "return_url": existing.get("return_url"),
+            "practice": practice,
+            "flow": flow,
+            "resume_index": resume_index,
+            "completed_real_trials": completed_real_trials,
         }
-    finally:
-        conn.close()
+
+    return create_new_session(participant_id, return_url)
+
+def insert_checkpoint(session_id: str, trials: list[dict[str, Any]], current_pos: int) -> dict[str, Any]:
+    sess = get_session_by_id(session_id)
+
+    if sess.get("status") == "finished":
+        raise ValueError("Session already finished")
+
+    responses = json_load_maybe(sess.get("responses_json"), [])
+    completed_real_trials = int(sess.get("completed_real_trials") or 0)
+    attention_correct = int(sess.get("attention_correct") or 0)
+
+    real_trials = [t for t in trials if str(t.get("kind")).lower() == "real"]
+    unsaved_real_count = len(real_trials)
+
+    if unsaved_real_count == 0:
+        raise ValueError("Checkpoint contained no real trials")
+
+    if unsaved_real_count != CHECKPOINT_SIZE and (completed_real_trials + unsaved_real_count) != 192:
+        raise ValueError("Checkpoint must contain 32 real trials unless it is the final checkpoint.")
+
+    expected_next = completed_real_trials + 1
+    real_order_indices = sorted(int(t["order_index"]) for t in real_trials)
+
+    if real_order_indices[0] != expected_next:
+        raise ValueError(f"Expected next real order index {expected_next}, got {real_order_indices[0]}")
+
+    if real_order_indices != list(range(real_order_indices[0], real_order_indices[0] + len(real_order_indices))):
+        raise ValueError("Real trial order indices in checkpoint are not contiguous.")
+
+    existing_real_order_indices = {
+        int(t["order_index"])
+        for t in responses
+        if str(t.get("kind")).lower() == "real" and t.get("order_index") is not None
+    }
+    if any(oi in existing_real_order_indices for oi in real_order_indices):
+        raise ValueError("Checkpoint includes already-saved real trials.")
+
+    stamped_trials: list[dict[str, Any]] = []
+    added_attention_correct = 0
+
+    for tr in trials:
+        kind = str(tr["kind"]).lower()
+        img = str(tr["img"])
+        answer = str(tr["answer"]).lower()
+        time_ms = int(tr["time_ms"])
+
+        saved = {
+            "kind": kind,
+            "order_index": int(tr["order_index"]) if tr.get("order_index") is not None else None,
+            "cycle": int(tr["cycle"]) if tr.get("cycle") is not None else None,
+            "img": img,
+            "answer": answer,
+            "time_ms": time_ms,
+            "recorded_at_unix": time.time(),
+        }
+
+        if kind == "attn":
+            saved["correct"] = 1 if answer == "same" else 0
+            if saved["correct"] == 1:
+                added_attention_correct += 1
+        elif kind == "real":
+            saved["correct"] = 1 if answer == correct_answer(img) else 0
+        else:
+            raise ValueError("Bad trial kind in checkpoint")
+
+        stamped_trials.append(saved)
+
+    responses.extend(stamped_trials)
+
+    new_completed_real_trials = completed_real_trials + unsaved_real_count
+    new_status = "finished" if new_completed_real_trials == 192 else "in_progress"
+    finished_at = time.time() if new_status == "finished" else None
+
+    patch = {
+        "responses_json": json.dumps(responses),
+        "completed_real_trials": new_completed_real_trials,
+        "attention_correct": attention_correct + added_attention_correct,
+        "last_saved_pos": int(current_pos),
+        "status": new_status,
+        "finished_at_unix": finished_at,
+    }
+
+    supabase_update(
+        "sessions",
+        filters={"session_id": f"eq.{session_id}"},
+        patch=patch,
+    )
+
+    return {
+        "ok": True,
+        "completed_real_trials": new_completed_real_trials,
+        "finished": new_status == "finished",
+        "return_url": sess.get("return_url"),
+    }
+
+# ============================================================
+# CSV export (ONE ROW PER PARTICIPANT)
+# ============================================================
+
+def build_export_csv() -> str:
+    sessions = supabase_fetch_all("sessions", order="started_at_unix.asc")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([
+        "participant_id",
+        "session_id",
+        "started_at_unix",
+        "finished_at_unix",
+        "status",
+        "attention_correct",
+        "completed_real_trials",
+        "last_saved_pos",
+        "return_url",
+        "practice_json",
+        "flow_json",
+        "responses_json",
+    ])
+
+    for sess in sessions:
+        writer.writerow([
+            sess.get("participant_id", ""),
+            sess.get("session_id", ""),
+            sess.get("started_at_unix", ""),
+            sess.get("finished_at_unix", ""),
+            sess.get("status", ""),
+            sess.get("attention_correct", ""),
+            sess.get("completed_real_trials", ""),
+            sess.get("last_saved_pos", ""),
+            sess.get("return_url", ""),
+            sess.get("practice_json", ""),
+            sess.get("flow_json", ""),
+            sess.get("responses_json", ""),
+        ])
+
+    return output.getvalue()
 
 # ============================================================
 # Front-end
@@ -714,7 +536,6 @@ INDEX_HTML = r"""
       background: #111; color: #fff; font-weight: 650; font-size: 16px; cursor: pointer;
       min-width: 160px;
     }
-    button.secondary { background: #fff; color: #111; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .imgbox { display: flex; justify-content: center; margin: 12px 0 6px; }
     img.stim { max-width: 600px; width: 100%; height: auto; border-radius: 12px; border: 1px solid #e6e6ea; }
@@ -736,9 +557,14 @@ INDEX_HTML = r"""
       <p class="center error" id="error-message"></p>
     </div>
 
+    <div class="card hidden" id="screen-locked">
+      <h2 class="center">Task Complete</h2>
+      <p class="center" id="locked-message">Your ID Has Already Cleared the Trials</p>
+    </div>
+
     <div class="card hidden" id="screen-title">
       <h1 class="center">Mental Rotation Task</h1>
-      <p class="center">Click start to begin.</p>
+      <p class="center" id="title-message">Click start to begin.</p>
       <div class="btnrow">
         <button id="btn-start">Start</button>
       </div>
@@ -759,7 +585,7 @@ INDEX_HTML = r"""
       </div>
       <div class="btnrow" id="choices"></div>
       <div class="meta" id="meta-row">
-        <div>Trial: <span class="kbd" id="trial-idx">1</span> / <span class="kbd">192</span></div>
+        <div>Real trial: <span class="kbd" id="trial-idx">1</span> / <span class="kbd">192</span></div>
         <div>Cycle: <span class="kbd" id="cycle-idx">1</span> / <span class="kbd">3</span></div>
       </div>
     </div>
@@ -779,6 +605,7 @@ INDEX_HTML = r"""
   const screens = {
     loading: $("screen-loading"),
     error: $("screen-error"),
+    locked: $("screen-locked"),
     title: $("screen-title"),
     ready: $("screen-ready"),
     test: $("screen-test"),
@@ -828,17 +655,13 @@ INDEX_HTML = r"""
   }
 
   function setButtonsEnabled(enabled) {
-    $("choices").querySelectorAll("button").forEach(b => {
-      b.disabled = !enabled;
-    });
+    $("choices").querySelectorAll("button").forEach(b => { b.disabled = !enabled; });
   }
 
   function practiceTitleText(item) {
     const name = (item.img || "").toLowerCase();
-    const mirrored = name.includes("mirrored");
-    const reference = name.includes("reference");
-    if (mirrored) return "This text is Mirrored";
-    if (reference) return "This text is Same";
+    if (name.includes("mirrored")) return "This text is Mirrored";
+    if (name.includes("reference")) return "This text is Same";
     return "This text is Normal";
   }
 
@@ -850,12 +673,14 @@ INDEX_HTML = r"""
   let flow = [];
   let pos = 0;
   let t0 = 0;
+  let completedRealTrials = 0;
+  let unsavedChunk = [];
+  let currentChunkStartPos = 0;
 
   function renderPractice(item) {
     $("meta-row").style.display = "none";
     $("stim-img").src = imgSrc(item);
     $("prompt").textContent = practiceTitleText(item);
-
     clearChoices();
 
     const isReference = (item.img || "").toLowerCase().includes("reference");
@@ -879,12 +704,12 @@ INDEX_HTML = r"""
 
   function renderTrial(item) {
     $("meta-row").style.display = "";
+    const currentReal = item.kind === "real"
+      ? item.order_index
+      : Math.min(192, completedRealTrials + unsavedChunk.filter(x => x.kind === "real").length + 1);
 
-    if (item.kind === "real") {
-      $("trial-idx").textContent = String(item.order_index);
-      $("cycle-idx").textContent = String(item.cycle);
-    }
-
+    $("trial-idx").textContent = String(currentReal);
+    $("cycle-idx").textContent = item.kind === "real" ? String(item.cycle) : "-";
     $("stim-img").src = imgSrc(item);
     clearChoices();
 
@@ -909,6 +734,24 @@ INDEX_HTML = r"""
     setButtonsEnabled(true);
   }
 
+  async function saveChunk() {
+    if (!unsavedChunk.length) {
+      return { ok: true, completed_real_trials: completedRealTrials, finished: false };
+    }
+
+    const payload = {
+      session_id: sessionId,
+      trials: unsavedChunk,
+      current_pos: pos
+    };
+
+    const resp = await api("/api/checkpoint", "POST", payload);
+    completedRealTrials = resp.completed_real_trials;
+    unsavedChunk = [];
+    currentChunkStartPos = pos;
+    return resp;
+  }
+
   async function submitAnswer(value) {
     if (!sessionId) return;
     setButtonsEnabled(false);
@@ -916,40 +759,46 @@ INDEX_HTML = r"""
     const item = flow[pos];
     const dt = Math.max(0, Math.round(performance.now() - t0));
 
-    try {
-      await api("/api/record", "POST", {
-        session_id: sessionId,
-        kind: item.kind,
-        order_index: item.kind === "real" ? item.order_index : null,
-        cycle: item.kind === "real" ? item.cycle : null,
-        img: item.img,
-        answer: value,
-        time_ms: dt
-      });
-    } catch (e) {
-      console.error(e);
-      setError("There was a problem saving your response. Please do not refresh. Contact the researcher.");
-      return;
-    }
+    unsavedChunk.push({
+      kind: item.kind,
+      order_index: item.kind === "real" ? item.order_index : null,
+      cycle: item.kind === "real" ? item.cycle : null,
+      img: item.img,
+      answer: value,
+      time_ms: dt
+    });
 
     pos += 1;
-    if (pos >= flow.length) {
+
+    const unsavedReal = unsavedChunk.filter(x => x.kind === "real").length;
+    const totalRealAfterThis = completedRealTrials + unsavedReal;
+    const needsCheckpoint = (unsavedReal === 32) || (totalRealAfterThis === 192);
+
+    if (needsCheckpoint) {
       try {
-        const resp = await api("/api/finish", "POST", { session_id: sessionId });
+        const resp = await saveChunk();
 
-        $("done-return-wrap").classList.add("hidden");
-        $("done-message").textContent = "You may now close this window.";
-
-        if (resp.return_url) {
-          returnUrl = resp.return_url;
-          $("done-message").textContent = "Your responses were saved. Click below to return to the survey.";
-          $("done-return-wrap").classList.remove("hidden");
+        if (resp.finished) {
+          $("done-return-wrap").classList.add("hidden");
+          $("done-message").textContent = "You may now close this window.";
+          if (resp.return_url) {
+            returnUrl = resp.return_url;
+            $("done-message").textContent = "Your responses were saved. Click below to return to the survey.";
+            $("done-return-wrap").classList.remove("hidden");
+          }
+          show("done");
+          return;
         }
       } catch (e) {
         console.error(e);
-        $("done-message").textContent = "The task ended, but there was a problem finalizing your session. Please contact the researcher.";
+        pos = currentChunkStartPos;
+        unsavedChunk = [];
+        setError("There was a problem saving at the checkpoint. You have been returned to the last saved checkpoint.");
+        return;
       }
+    }
 
+    if (pos >= flow.length) {
       show("done");
       return;
     }
@@ -964,17 +813,35 @@ INDEX_HTML = r"""
         return_url: returnUrl
       });
 
+      if (resp.mode === "completed") {
+        $("locked-message").textContent = resp.message || "Your ID Has Already Cleared the Trials";
+        show("locked");
+        return;
+      }
+
       sessionId = resp.session_id;
       practice = resp.practice || [];
       flow = resp.flow || [];
+      completedRealTrials = resp.completed_real_trials || 0;
+      pos = resp.resume_index || 0;
+      currentChunkStartPos = pos;
       practicePos = 0;
-      pos = 0;
+      unsavedChunk = [];
 
-      if (!practice.length) {
+      if (resp.mode === "resume") {
+        $("title-message").textContent = `Resuming from checkpoint after real trial ${completedRealTrials}. Click start to continue.`;
+      } else {
+        $("title-message").textContent = "Click start to begin.";
+      }
+
+      if (resp.mode === "resume") {
         show("ready");
       } else {
-        show("test");
-        renderPractice(practice[practicePos]);
+        if (!practice.length) show("ready");
+        else {
+          show("test");
+          renderPractice(practice[practicePos]);
+        }
       }
     } catch (e) {
       console.error(e);
@@ -987,14 +854,16 @@ INDEX_HTML = r"""
       setError("No trials were loaded.");
       return;
     }
+    if (pos >= flow.length) {
+      show("done");
+      return;
+    }
     show("test");
     renderTrial(flow[pos]);
   });
 
   $("btn-return").addEventListener("click", () => {
-    if (returnUrl) {
-      window.location.href = returnUrl;
-    }
+    if (returnUrl) window.location.href = returnUrl;
   });
 
   function initFromURL() {
@@ -1012,6 +881,51 @@ INDEX_HTML = r"""
 
   initFromURL();
 </script>
+</body>
+</html>
+"""
+
+DATA_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Download Data</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { margin: 0; background: #f6f6f7; color: #111; }
+    .wrap { max-width: 480px; margin: 0 auto; padding: 40px 18px; }
+    .card {
+      background: #fff; border: 1px solid #e6e6ea; border-radius: 14px;
+      padding: 24px; box-shadow: 0 4px 18px rgba(0,0,0,0.05);
+    }
+    input[type=password] {
+      width: 100%; padding: 12px; border-radius: 10px; border: 1px solid #d7d7de;
+      margin-top: 10px; box-sizing: border-box; font-size: 16px;
+    }
+    button {
+      margin-top: 14px; padding: 12px 16px; border-radius: 12px; border: 1px solid #d7d7de;
+      background: #111; color: #fff; font-weight: 650; font-size: 16px; cursor: pointer;
+      width: 100%;
+    }
+    .error { color: #b00020; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>Download Data</h2>
+      <p>Enter the password to download all saved data as CSV.</p>
+      <form method="post">
+        <input type="password" name="password" autocomplete="current-password" required />
+        <button type="submit">Download CSV</button>
+      </form>
+      {% if error %}
+        <div class="error">{{ error }}</div>
+      {% endif %}
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -1036,6 +950,25 @@ def serve_prac_imgs(filename: str):
 def health():
     return jsonify({"ok": True})
 
+@app.route("/data", methods=["GET", "POST"])
+def data_download():
+    if request.method == "GET":
+        return render_template_string(DATA_HTML, error=None)
+
+    submitted = str(request.form.get("password", ""))
+    if not hmac.compare_digest(submitted, DATA_EXPORT_PASSWORD):
+        return render_template_string(DATA_HTML, error="Incorrect password.")
+
+    csv_text = build_export_csv()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"mental_rotation_data_{ts}.csv"
+
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
     data = request.get_json(silent=True) or {}
@@ -1047,71 +980,34 @@ def api_start():
     if not participant_id:
         return "Missing participant_id", 400
 
-    session_data = create_session(participant_id, return_url)
-    return jsonify({
-        "session_id": session_data["session_id"],
-        "practice": session_data["practice"],
-        "flow": session_data["flow"],
-    })
-
-@app.route("/api/record", methods=["POST"])
-def api_record():
-    data = request.get_json(silent=True) or {}
-
-    session_id = str(data.get("session_id", "")).strip()
-    kind = str(data.get("kind", "")).strip().lower()
-    img = str(data.get("img", "")).strip()
-    answer = str(data.get("answer", "")).strip().lower()
-
-    time_ms_raw = data.get("time_ms", None)
-    order_index = data.get("order_index", None)
-    cycle = data.get("cycle", None)
-
-    if not session_id or not img or time_ms_raw is None:
-        return "Bad record payload", 400
-
     try:
-        time_ms = int(time_ms_raw)
-    except Exception:
-        return "time_ms must be int", 400
+        session_data = load_or_create_session(participant_id, return_url)
+    except Exception as e:
+        return f"Failed to start session: {e}", 500
 
-    if time_ms < 0:
-        return "time_ms must be nonnegative", 400
+    return jsonify(session_data)
 
-    if kind not in ("real", "attn"):
-        return "Bad kind", 400
-
-    try:
-        if order_index is not None:
-            order_index = int(order_index)
-        if cycle is not None:
-            cycle = int(cycle)
-
-        record_trial(
-            session_id=session_id,
-            kind=kind,
-            order_index=order_index,
-            cycle=cycle,
-            img=img,
-            answer=answer,
-            time_ms=time_ms,
-        )
-    except ValueError as e:
-        return str(e), 400
-
-    return jsonify({"ok": True})
-
-@app.route("/api/finish", methods=["POST"])
-def api_finish():
+@app.route("/api/checkpoint", methods=["POST"])
+def api_checkpoint():
     data = request.get_json(silent=True) or {}
     session_id = str(data.get("session_id", "")).strip()
+    trials = data.get("trials", [])
+    current_pos = data.get("current_pos", None)
+
     if not session_id:
         return "Missing session_id", 400
+    if not isinstance(trials, list) or not trials:
+        return "Missing trials", 400
+    if current_pos is None:
+        return "Missing current_pos", 400
 
     try:
-        result = finish_session(session_id)
+        current_pos = int(current_pos)
+        result = insert_checkpoint(session_id, trials, current_pos)
     except ValueError as e:
         return str(e), 400
+    except Exception as e:
+        return f"Failed to save checkpoint: {e}", 500
 
     return jsonify(result)
 
@@ -1131,10 +1027,8 @@ def validate_assets() -> None:
 
 if __name__ == "__main__":
     validate_assets()
-    init_db()
     print(f"Serving on http://127.0.0.1:{PORT}")
     print(f"Images directory:   {IMGS_DIR}")
     print(f"Practice directory: {PRAC_DIR}")
-    print(f"SQLite DB:          {DB_PATH}")
-    print(f"CSV output:         {CSV_PATH}")
+    print(f"Supabase URL:       {SUPABASE_URL}")
     app.run(host="0.0.0.0", port=PORT, debug=True)
