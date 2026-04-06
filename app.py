@@ -527,8 +527,10 @@ INDEX_HTML = r"""
       background: #fff; border: 1px solid #e6e6ea; border-radius: 14px;
       padding: 22px; box-shadow: 0 4px 18px rgba(0,0,0,0.05);
     }
-    h1,h2 { margin: 0 0 12px; }
+    h1,h2,h3 { margin: 0 0 12px; }
     p { margin: 10px 0; line-height: 1.35; color: #333; }
+    ul { margin: 8px 0 14px 22px; color: #333; }
+    li { margin: 6px 0; line-height: 1.35; }
     .center { text-align: center; }
     .btnrow { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
     button {
@@ -543,6 +545,7 @@ INDEX_HTML = r"""
     .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: #f1f1f3; padding: 2px 6px; border-radius: 6px; border: 1px solid #e3e3e8;}
     .hidden { display: none; }
     .error { color: #b00020; }
+    .instructions { max-width: 760px; margin: 0 auto; }
   </style>
 </head>
 <body>
@@ -570,6 +573,55 @@ INDEX_HTML = r"""
       </div>
     </div>
 
+    <div class="card hidden" id="screen-instructions">
+      <div class="instructions">
+        <h2 class="center">Instructions</h2>
+
+        <p>In this task, you will see letters presented either:</p>
+        <ul>
+          <li>in pairs, or</li>
+          <li>one at a time</li>
+        </ul>
+
+        <p>The letters may be rotated at different angles.</p>
+
+        <h3>1. When TWO letters are shown:</h3>
+        <p>Your task is to decide whether the letters are:</p>
+        <ul>
+          <li><strong>Same</strong> → the letters are identical, just rotated</li>
+          <li><strong>Mirror</strong> → one letter is a flipped (mirror image) version of the other</li>
+        </ul>
+        <p>Rotation does not change whether letters are the same—only flipping does.</p>
+
+        <h3>2. When ONE letter is shown:</h3>
+        <p>Your task is to decide whether the letter is:</p>
+        <ul>
+          <li><strong>Normal</strong> → the letter is in its standard (non-mirrored) form</li>
+          <li><strong>Mirrored</strong> → the letter is flipped</li>
+        </ul>
+
+        <h3>How to Respond:</h3>
+        <ul>
+          <li>Use your mouse to click the correct button on the screen</li>
+          <li>Each trial will display the appropriate response options (e.g., Same / Mirror or Normal / Mirrored)</li>
+          <li>Click the option that best matches your answer</li>
+        </ul>
+
+        <h3>General Guidelines:</h3>
+        <ul>
+          <li>Letters may appear at different rotations</li>
+          <li>You may need to mentally rotate the letters to decide</li>
+          <li>Respond as quickly and accurately as possible</li>
+          <li>Try to keep your cursor near the response buttons to respond efficiently</li>
+          <li>Stay focused and avoid distractions</li>
+        </ul>
+
+        <div class="btnrow">
+          <button id="btn-begin-practice">Begin Practice Trials</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card hidden" id="screen-ready">
       <h2 class="center">Practice complete</h2>
       <p class="center">When you're ready, start the real task.</p>
@@ -591,7 +643,7 @@ INDEX_HTML = r"""
     </div>
 
     <div class="card hidden" id="screen-done">
-      <h2 class="center">Thank you for participating in this research endeavor!</h2>
+      <h2 class="center">Thank you!</h2>
       <p class="center" id="done-message">You may now close this window.</p>
       <div class="btnrow hidden" id="done-return-wrap">
         <button id="btn-return">Return to Survey</button>
@@ -607,6 +659,7 @@ INDEX_HTML = r"""
     error: $("screen-error"),
     locked: $("screen-locked"),
     title: $("screen-title"),
+    instructions: $("screen-instructions"),
     ready: $("screen-ready"),
     test: $("screen-test"),
     done: $("screen-done")
@@ -837,16 +890,21 @@ INDEX_HTML = r"""
       if (resp.mode === "resume") {
         show("ready");
       } else {
-        if (!practice.length) show("ready");
-        else {
-          show("test");
-          renderPractice(practice[practicePos]);
-        }
+        show("instructions");
       }
     } catch (e) {
       console.error(e);
       setError("Could not start the task.");
     }
+  });
+
+  $("btn-begin-practice").addEventListener("click", () => {
+    if (!practice.length) {
+      show("ready");
+      return;
+    }
+    show("test");
+    renderPractice(practice[practicePos]);
   });
 
   $("btn-begin-test").addEventListener("click", () => {
